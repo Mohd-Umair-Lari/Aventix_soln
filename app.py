@@ -137,13 +137,16 @@ class Pipeline:
                 volume = self._volume(height, ptype, str(meta.liquid).lower(), meta.density_g_per_mL)
                 hm, vm = self._meniscus(str(meta.liquid).lower(), meta.density_g_per_mL, radius) if np.isfinite(height) else (np.nan, np.nan)
                 sensors = set(fp.sensor.astype(int)) if len(fp) else set()
+                well_row = ord(wr.well[0].upper()) - 64
                 well_col = int(re.sub(r"[^0-9]", "", wr.well))
-                n_chans = 16 if ptype == "EP384" else 8
-                chan_num = (well_col - 1) % n_chans + 1
+                chan_num = well_row
+                max_r = 16 if ptype == "EP384" else 8
+                max_c = 24 if ptype == "EP384" else 12
+                is_edge = (well_row == 1) or (well_row == max_r) or (well_col == 1) or (well_col == max_c)
 
                 rows.append({
                     **meta.to_dict(), "scan_id": scan_id, "well": wr.well,
-                    "row": ord(wr.well[0].upper()) - 64, "col": well_col, "channel": chan_num,
+                    "row": well_row, "col": well_col, "channel": chan_num, "is_edge": is_edge,
                     "centre_x_mm": wr.centre_x_mm, "centre_y_mm": wr.centre_y_mm, "radius_mm": radius,
                     "point_count": len(fp), "sensor_count": len(sensors), "z_floor_mm": zf, "z_surface_mm": zs,
                     "fluid_height_mm": height, "meniscus_height_mm": hm, "meniscus_volume_uL": vm,
@@ -185,6 +188,8 @@ class Pipeline:
                 reasons.append(("RULE_4", "PARTIAL_SCAN", "WARNING"))
             if r.baseline_estimated:
                 reasons.append(("RULE_6", "BASELINE_ESTIMATED", "WARNING"))
+            if r.is_edge and pd.notna(r.gravimetric_deviation_pct) and abs(r.gravimetric_deviation_pct) > CONFIG["TOLERANCE_PCT"]:
+                reasons.append(("RULE_5", "EDGE_EFFECT", "WARNING"))
 
             if reasons:
                 df.loc[idx, "fault_reason"] = "; ".join(x[1] for x in reasons)
@@ -203,16 +208,26 @@ class Pipeline:
                         df.loc[cur_idx, "fault_reason"] = (df.loc[cur_idx, "fault_reason"] + "; STEP_REGRESSION").strip(";")
                         df.loc[cur_idx, "status"] = "FAIL"
 
-        for _, s_grp in df.groupby("scan_id"):
-            for _, ch_grp in s_grp.groupby("channel"):
-                bad = ch_grp[ch_grp["gravimetric_deviation_pct"].abs() > CONFIG["TOLERANCE_PCT"]]
-                if len(bad) >= 4 and np.sign(bad["gravimetric_deviation_pct"]).nunique() == 1:
+        for scan_id, s_grp in df.groupby("scan_id"):
+            ptype = "EP384" if "384" in str(s_grp.plate_type.iloc[0]) else "AB0796"
+            max_c = 24 if ptype == "EP384" else 12
+            valid = s_grp[s_grp.nominal_uL > 0]
+            if valid.empty: continue
+
+            interior = valid[~valid.is_edge]
+            scan_baseline = interior["gravimetric_deviation_pct"].median() if len(interior) >= 10 else valid["gravimetric_deviation_pct"].median()
+
+            for ch, ch_grp in valid.groupby("channel"):
+                ch_test = ch_grp[(ch_grp.col > 1) & (ch_grp.col < max_c)]
+                if len(ch_test) < 4: ch_test = ch_grp
+                rel_devs = ch_test["gravimetric_deviation_pct"] - scan_baseline
+                bad = rel_devs[rel_devs.abs() > 10.0]
+                if len(bad) >= 4 and np.sign(bad).nunique() == 1 and abs(rel_devs.median()) > 10.0:
                     for b_idx in bad.index:
                         cur_rules = df.loc[b_idx, "rule_id"]
                         if "RULE_2" not in cur_rules:
                             df.loc[b_idx, "rule_id"] = (cur_rules + ";RULE_2").strip(";")
                             df.loc[b_idx, "fault_reason"] = (df.loc[b_idx, "fault_reason"] + "; CHANNEL_BIAS").strip(";")
-                            df.loc[b_idx, "status"] = "FAIL"
 
     def _build_graph(self):
         g = self.graph
